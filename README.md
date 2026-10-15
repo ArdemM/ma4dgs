@@ -20,13 +20,19 @@ Alles, was von anderen stammt und hier verwendet wird:
   - `ma4dgs/relocation.py` ist an `gsplat/strategy/ops.py` (`relocate`) angelehnt.
   - Rasterisierer, SH-Auswertung und PLY-Export werden aus `gsplat` importiert, COLMAP-Parser und Hilfsfunktionen (`knn`, `rgb_to_sh`, `set_random_seed`) unverändert aus `gsplat/examples` (`datasets/`, `utils.py`).
 - **FreeTimeGsVanilla (AGPL-3.0)**, [OpsiClear-4DGS/FreeTimeGsVanilla](https://github.com/OpsiClear-4DGS/FreeTimeGsVanilla): nur als Referenz ausgeführt und gelesen (`scripts/run_vanilla_ref.sh`), kein Code übernommen. Das Datenlayout (`images/camXX/`, `points/`) folgt seinem Format, damit beide dieselben Daten lesen.
+- **BiRefNet (MIT)**, P. Zheng et al., *Bilateral Reference for High-Resolution Dichotomous Image Segmentation*, CAAI AIR 2024. Modell [`ZhengPeng7/BiRefNet`](https://huggingface.co/ZhengPeng7/BiRefNet), Revision `e2bf8e4` (dieselbe wie in 4DAnyone). `scripts/prepare_4danyone.py` lädt es über Hugging Face transformers (der Modellcode kommt per `trust_remote_code` aus dem Modell-Repository) und berechnet damit die Vordergrundmasken.
 
 **Werkzeuge und Bibliotheken**
 - COLMAP (Kameraposen, Triangulation), ffmpeg (Frames aus Videos)
+- Hugging Face transformers, timm, kornia, einops (nur zum Laden und Ausführen von BiRefNet)
 - PyTorch, torchmetrics (PSNR, SSIM, LPIPS mit den Netzgewichten von R. Zhang et al., CVPR 2018), viser und nerfview (Viewer), tyro, OpenCV, imageio, scikit-learn, pycolmap, NumPy, PyYAML, tqdm
+
+**Methoden für generierte Ansichten** (`scripts/prepare_4danyone.py`)
+- **Visual Hull / Space Carving**: A. Laurentini, *The Visual Hull Concept for Silhouette-Based Image Understanding*, IEEE TPAMI 1994. Eigene Umsetzung zur Initialisierung pro Frame.
 
 **Daten**
 - **Neural3DV / DyNeRF**: T. Li et al., *Neural 3D Video Synthesis from Multi-view Video*, CVPR 2022 (Meta). Szene `flame_steak`.
+- **4DAnyone** (AntResearch, Apache-2.0), [ant-research/4DAnyone](https://github.com/ant-research/4DAnyone): erzeugt aus einem eigenen Video synchrone Ansichten mit Kameras (`cameras.json`, `videos/dense/`). Ausgeführt auf einem anderen Rechner; hier wird nur seine Ausgabe gelesen.
 
 **KI-Unterstützung**
 - Code und Dokumentation sind mit Unterstützung von KI entstanden (Claude Code, Anthropic). Commits mit KI-Beteiligung tragen die Zeile `Co-Authored-By: Claude`.
@@ -47,6 +53,7 @@ cd ~/masterarbeit/ma4dgs     # Python nie in ~/masterarbeit selbst starten
 | `scripts/` | Datenvorbereitung, Lauf-Skripte |
 | `~/masterarbeit/data/n3dv/raw/<szene>/` | Original-Videos Neural3DV (`camXX.mp4`, `poses_bounds.npy`) |
 | `~/masterarbeit/data/n3dv/<szene>_<N>f/` | vorbereitete Szene (siehe unten) |
+| `~/masterarbeit/data/4danyone/<name>/` | vorbereitete 4DAnyone-Ausgabe (siehe „4DAnyone-Ausgabe vorbereiten“) |
 | `~/masterarbeit/results/` | Trainingsläufe (TensorBoard, Checkpoints) |
 | `EXPERIMENTS.md` | Protokoll aller Läufe |
 
@@ -121,6 +128,24 @@ cd ~/masterarbeit/gsplat/examples
 python simple_trainer.py mcmc --data_dir ~/masterarbeit/data/n3dv/flame_steak_50f/frame0 \
     --data_factor 1 --result_dir ~/masterarbeit/results/flame_steak_frame0 --max_steps 7000
 ```
+
+## 4DAnyone-Ausgabe vorbereiten
+
+Ausführliche Schritt-für-Schritt-Anleitung: `Anleitung_4DAnyone_zu_4DGS.md` im Workspace (Windows). Kurzform:
+
+```bash
+# einmalig: Pakete für BiRefNet
+~/.local/bin/uv pip install --python ~/masterarbeit/.venv/bin/python transformers timm kornia einops
+
+python scripts/prepare_4danyone.py --src /mnt/c/.../4DAnyone/<name> --out ~/masterarbeit/data/4danyone/<name>
+bash scripts/run_4danyone.sh ~/masterarbeit/data/4danyone/<name> ~/masterarbeit/results/4danyone/<name>
+python scripts/view_4d.py --ckpt ~/masterarbeit/results/4danyone/<name>/ckpts/ckpt_final.pt
+```
+
+`prepare_4danyone.py` schreibt dasselbe Layout wie `prepare_n3dv.py` und zusätzlich `masks/camXX/NNNNN.png`:
+Frames (ffmpeg), Masken (BiRefNet), Punktwolke pro Frame als Visual Hull aus Masken und bekannten Kameras (statt SIFT-Triangulation), COLMAP-Modell direkt aus `cameras.json` (ohne COLMAP-Lauf).
+Die Welt wird dabei von y-oben auf z-oben gedreht: Mit exakt +y als Oben-Richtung spiegelt `similarity_from_cameras` aus gsplat/examples die Szene, statt sie zu drehen.
+Mit Masken lernt `train.py` nur den Vordergrund (`--background random|black|white`, `--lambda-mask`); `run_4danyone.sh` setzt das zusammen mit dem vollen Modell, `--test-cams` ohne Wert (alle Kameras trainieren) und `--traj-mode orbit`.
 
 ## Referenz: FreeTimeGsVanilla
 
