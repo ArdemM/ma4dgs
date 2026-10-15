@@ -110,6 +110,14 @@ class Config:
     lambda_ssim: float = 0.2
     lambda_perc: float = 0.0
 
+    # Hintergrund. "image" = Bild unverändert als Ziel (Neural3DV). Sonst braucht der
+    # Datensatz masks/ (scripts/prepare_4danyone.py): Ziel = Bild·Maske + Hintergrund·(1 − Maske),
+    # gerendert wird vor demselben Hintergrund. "random" = neue Zufallsfarbe pro Schritt
+    # (Auswertung und Videos dann schwarz), zwingt transparente Bereiche auf Opazität 0.
+    background: Literal["image", "black", "white", "random"] = "image"
+    # L1 zwischen gerenderter Opazität und Maske (nur mit masks/)
+    lambda_mask: float = 0.0
+
     # Gaußsche mit σ(t) unter diesem Wert werden nicht rasterisiert
     temporal_cull: float = 1e-3
     near_plane: float = 0.01
@@ -117,8 +125,10 @@ class Config:
 
     tb_every: int = 100
     lpips_net: Literal["vgg", "alex"] = "alex"
-    # Trajektorien-Video (Kamerafahrt auf einem Bogen vor der Szene, Zeit läuft mit)
+    # Trajektorien-Video (Kamerafahrt, Zeit läuft mit). "arc" = Bogen vor der Szene
+    # (Kameras auf einer Seite, Neural3DV), "orbit" = voller Kreis (Kameras rundherum, 4DAnyone)
     render_traj: bool = True
+    traj_mode: Literal["arc", "orbit"] = "arc"
     traj_frames: int = 300  # 10 s bei 30 FPS
     # Anteil der Kamera-Spannweite, den der Bogen abdeckt (< 1 bleibt im gut gesehenen Bereich)
     traj_arc_scale: float = 0.8
@@ -138,6 +148,8 @@ class Runner:
         self.data = MultiViewVideo(
             cfg.data_dir, cfg.test_cams, cfg.num_frames, workers=cfg.load_workers
         )
+        if cfg.background != "image" or cfg.lambda_mask > 0:
+            assert self.data.masks is not None, f"--background/--lambda-mask brauchen {cfg.data_dir}/masks"
         self.scene_scale = self.data.scene_scale * 1.1
         F = self.data.num_frames
         print(
@@ -208,8 +220,15 @@ class Runner:
             net_type=cfg.lpips_net, normalize=True
         ).to(self.device)
 
-    def render(self, cam: int, t: float, sh_degree: int, c2w: Optional[torch.Tensor] = None):
-        """Bild der Kamera cam (bzw. Pose c2w) zum Zeitpunkt t, Form [1, H, W, 3]."""
+    def render(
+        self,
+        cam: int,
+        t: float,
+        sh_degree: int,
+        c2w: Optional[torch.Tensor] = None,
+        bg: Optional[torch.Tensor] = None,
+    ):
+        """Bild der Kamera cam (bzw. Pose c2w) zum Zeitpunkt t vor Hintergrund bg [1, 3], Form [1, H, W, 3]."""
         if c2w is None:
             c2w = torch.from_numpy(self.data.camtoworlds[cam]).to(self.device)
         K = torch.from_numpy(self.data.Ks[cam]).to(self.device)
@@ -228,8 +247,28 @@ class Runner:
             sh_degree=sh_degree,
             near_plane=self.cfg.near_plane,
             far_plane=self.cfg.far_plane,
+            backgrounds=bg,
         )
         return colors, alphas, info, mask
+
+    def background(self, train: bool) -> Optional[torch.Tensor]:
+        """Hintergrundfarbe [1, 3] oder None (= Bild unverändert, Rendern vor Schwarz)."""
+        mode = self.cfg.background
+        if mode == "image":
+            return None
+        if mode == "random" and train:
+            return torch.rand((1, 3), device=self.device)
+        return torch.full((1, 3), 1.0 if mode == "white" else 0.0, device=self.device)
+
+    def target(self, cam: int, frame: int, bg: Optional[torch.Tensor]):
+        """Zielbild [1, H, W, 3] in [0, 1] und Maske [1, H, W, 1] (None ohne masks/)."""
+        pixels = self.data.images[cam, frame].to(self.device, non_blocking=True).float()[None] / 255.0
+        if self.data.masks is None:
+            return pixels, None
+        m = self.data.masks[cam, frame].to(self.device, non_blocking=True).float()[None, ..., None] / 255.0
+        if bg is not None:
+            pixels = pixels * m + bg * (1.0 - m)
+        return pixels, m
 
     def train(self) -> None:
         cfg = self.cfg
@@ -254,8 +293,8 @@ class Runner:
         for step in pbar:
             cam, frame = items[rng.integers(len(items))]
             t = float(self.data.times[frame])
-            pixels = self.data.images[cam, frame].to(self.device, non_blocking=True)
-            pixels = pixels.float()[None] / 255.0  # [1, H, W, 3]
+            bg = self.background(train=True)
+            pixels, fg = self.target(cam, frame, bg)  # [1, H, W, 3], [1, H, W, 1] / None
 
             if cfg.velocities_lr_final is not None and "velocities" in self.optimizers:
                 p = step / max_steps
@@ -263,7 +302,7 @@ class Runner:
                 self.optimizers["velocities"].param_groups[0]["lr"] = lr
 
             sh_degree = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-            colors, _, info, mask = self.render(cam, t, sh_degree)
+            colors, alphas, info, mask = self.render(cam, t, sh_degree, bg=bg)
             visible_sum += int(mask.sum())
             if self.relocator is not None:
                 info["means2d"].retain_grad()
@@ -279,6 +318,10 @@ class Runner:
                     colors.clamp(0, 1).permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
                 )
                 loss = loss + cfg.lambda_perc * lpipsloss
+            maskloss = None
+            if cfg.lambda_mask > 0:
+                maskloss = (alphas - fg).abs().mean()
+                loss = loss + cfg.lambda_mask * maskloss
             regloss = None
             if cfg.lambda_reg > 0 and step < cfg.reg_until:
                 # Gl. 6: Basis-Opazität, gewichtet mit sg[σ(t)], gemittelt über alle N
@@ -311,6 +354,8 @@ class Runner:
                 w.add_scalar("train/ssimloss", ssimloss.item(), step)
                 if regloss is not None:
                     w.add_scalar("train/regloss", regloss.item(), step)
+                if maskloss is not None:
+                    w.add_scalar("train/maskloss", maskloss.item(), step)
                 if "velocities" in self.optimizers:
                     w.add_scalar("train/velocities_lr", self.optimizers["velocities"].param_groups[0]["lr"], step)
                 w.add_scalar("train/visible_GS", int(mask.sum()), step)
@@ -349,10 +394,14 @@ class Runner:
     @torch.no_grad()
     def eval(self, step: int) -> dict:
         cfg = self.cfg
+        if not self.data.test_cams:
+            print(f"Evaluation (Schritt {step}) übersprungen: keine Testkamera")
+            return {}
         print(f"Evaluation (Schritt {step}) ...")
         metrics = defaultdict(list)
         per_frame = []
         render_time = 0.0
+        bg = self.background(train=False)
         for cam in self.data.test_cams:
             name = self.data.cam_names[cam]
             writer = imageio.get_writer(
@@ -360,10 +409,10 @@ class Runner:
             )
             for frame in range(self.data.num_frames):
                 t = float(self.data.times[frame])
-                pixels = self.data.images[cam, frame].to(self.device).float()[None] / 255.0
+                pixels, _ = self.target(cam, frame, bg)
                 torch.cuda.synchronize()
                 tic = time.time()
-                colors, _, _, mask = self.render(cam, t, cfg.sh_degree)
+                colors, _, _, mask = self.render(cam, t, cfg.sh_degree, bg=bg)
                 torch.cuda.synchronize()
                 render_time += time.time() - tic
                 colors = colors.clamp(0.0, 1.0)
@@ -420,12 +469,16 @@ class Runner:
 
     @torch.no_grad()
     def render_traj(self, step: int) -> None:
-        """Kamerafahrt auf einem Bogen um den Fokuspunkt, die Zeit läuft dabei von 0 bis 1.
+        """Kamerafahrt um den Fokuspunkt, die Zeit läuft dabei von 0 bis 1.
 
-        Die Neural3DV-Kameras hängen in zwei Reihen übereinander. Eine Fahrt *durch*
+        "arc": Die Neural3DV-Kameras hängen in zwei Reihen übereinander. Eine Fahrt *durch*
         die Kameras springt deshalb ständig zwischen den Reihen. Stattdessen schwenkt
         die Kamera auf mittlerer Höhe sinusförmig hin und her (Start und Ende in der
         Mitte, ohne Ruck) und blickt immer auf den Punkt, auf den alle Kameras zielen.
+
+        "orbit": Bei Kameras rundherum (4DAnyone) liegt die mittlere Kameraposition im
+        Zentrum. Die Fahrt startet bei der ersten Trainingskamera und umrundet die Szene
+        einmal auf mittlerem Abstand und mittlerer Höhe der Kameras.
         """
         cfg = self.cfg
         c2ws = self.data.camtoworlds[self.data.train_cams]
@@ -433,19 +486,26 @@ class Runner:
         # Kamera-y zeigt nach unten (OpenCV), die Welt-Oben-Richtung ist das Negative
         up = -c2ws[:, :3, 1].mean(0)
         up /= np.linalg.norm(up)
-        offset = c2ws[:, :3, 3].mean(0) - focus  # mittlere Kameraposition relativ zum Fokus
-
-        # Halbe Bogenweite aus der Verteilung der Kameras (Azimut um die Oben-Achse)
-        ref = offset - (offset @ up) * up
-        ref /= np.linalg.norm(ref)
-        side = np.cross(up, ref)
         rel = c2ws[:, :3, 3] - focus
-        azimuths = np.arctan2(rel @ side, rel @ ref)
-        half = cfg.traj_arc_scale * 0.5 * (azimuths.max() - azimuths.min())
-        print(f"Kamerafahrt: Bogen ±{np.degrees(half):.1f}°, {cfg.traj_frames} Bilder")
-
         n = cfg.traj_frames
-        angles = half * np.sin(2 * np.pi * np.arange(n) / n)
+
+        if cfg.traj_mode == "orbit":
+            heights = rel @ up
+            radial = rel - heights[:, None] * up
+            ref = radial[0] / np.linalg.norm(radial[0])
+            offset = ref * np.linalg.norm(radial, axis=1).mean() + up * heights.mean()
+            angles = 2 * np.pi * np.arange(n) / n
+            print(f"Kamerafahrt: Kreis, {n} Bilder")
+        else:
+            offset = c2ws[:, :3, 3].mean(0) - focus  # mittlere Kameraposition relativ zum Fokus
+            # Halbe Bogenweite aus der Verteilung der Kameras (Azimut um die Oben-Achse)
+            ref = offset - (offset @ up) * up
+            ref /= np.linalg.norm(ref)
+            side = np.cross(up, ref)
+            azimuths = np.arctan2(rel @ side, rel @ ref)
+            half = cfg.traj_arc_scale * 0.5 * (azimuths.max() - azimuths.min())
+            print(f"Kamerafahrt: Bogen ±{np.degrees(half):.1f}°, {n} Bilder")
+            angles = half * np.sin(2 * np.pi * np.arange(n) / n)
         path = np.zeros((n, 4, 4), np.float32)
         for i, a in enumerate(angles):
             # Rodrigues-Drehung von offset um die Oben-Achse
@@ -456,10 +516,11 @@ class Runner:
         times = np.linspace(0.0, 1.0, n)
         cams = self.data.train_cams
 
+        bg = self.background(train=False)
         writer = imageio.get_writer(self.result_dir / "videos" / f"traj_step{step}.mp4", fps=30, macro_block_size=2)
         for i in tqdm.trange(len(path), desc="Trajektorie"):
             c2w = torch.from_numpy(path[i]).to(self.device)
-            colors, _, _, _ = self.render(cams[0], float(times[i]), self.cfg.sh_degree, c2w=c2w)
+            colors, _, _, _ = self.render(cams[0], float(times[i]), self.cfg.sh_degree, c2w=c2w, bg=bg)
             writer.append_data((colors[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
         writer.close()
 

@@ -4,6 +4,7 @@
     <szene>/sparse/0                 COLMAP-Modell von Frame 0 (Bildnamen camXX.png)
     <szene>/frame0/                  images/camXX.png + sparse -> ../sparse
     <szene>/points/                  Punktwolken pro Frame (scripts/triangulate_frames.py)
+    <szene>/masks/camXX/NNNNN.png    optional: Vordergrundmasken 0–255 (scripts/prepare_4danyone.py)
 
 Die Kameras stehen still, deshalb werden Posen und Intrinsics einmal mit dem
 COLMAP-Parser aus gsplat/examples auf frame0/ gelesen (inkl. Normalisierung
@@ -75,28 +76,32 @@ class MultiViewVideo:
         self.test_items = [(c, f) for c in self.test_cams for f in range(F)]
 
         self.images = self._load_images(workers)  # [C, F, H, W, 3] uint8
+        # [C, F, H, W] uint8 oder None, falls der Datensatz keine Masken hat
+        self.masks = self._load_images(workers, "masks") if (self.scene_dir / "masks").is_dir() else None
 
-    def image_path(self, cam: int, frame: int) -> Path:
-        return self.scene_dir / "images" / self.cam_names[cam] / f"{frame:05d}.png"
+    def image_path(self, cam: int, frame: int, kind: str = "images") -> Path:
+        return self.scene_dir / kind / self.cam_names[cam] / f"{frame:05d}.png"
 
-    def _load_images(self, workers: int) -> torch.Tensor:
-        """Alle Bilder einmal dekodieren und im Hauptspeicher halten (uint8)."""
+    def _load_images(self, workers: int, kind: str = "images") -> torch.Tensor:
+        """Alle Bilder (bzw. Masken) einmal dekodieren und im Hauptspeicher halten (uint8)."""
         W, H = self.imsizes[0]
         assert all(s == (W, H) for s in self.imsizes), "Kameras mit unterschiedlicher Auflösung"
         C, F = len(self.cam_names), self.num_frames
-        images = torch.empty((C, F, H, W, 3), dtype=torch.uint8)
+        gray = kind == "masks"
+        images = torch.empty((C, F, H, W) if gray else (C, F, H, W, 3), dtype=torch.uint8)
 
         def load(item: Tuple[int, int]) -> None:
             c, f = item
-            img = cv2.imread(str(self.image_path(c, f)), cv2.IMREAD_COLOR)
-            assert img is not None, f"Bild fehlt: {self.image_path(c, f)}"
-            assert img.shape[:2] == (H, W), f"{self.image_path(c, f)}: {img.shape}"
-            images[c, f] = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            path = self.image_path(c, f, kind)
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR)
+            assert img is not None, f"Bild fehlt: {path}"
+            assert img.shape[:2] == (H, W), f"{path}: {img.shape}"
+            images[c, f] = torch.from_numpy(img if gray else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
         items = [(c, f) for c in range(C) for f in range(F)]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(load, items))
-        print(f"[Data] {C} Kameras x {F} Frames geladen ({images.numel() / 1024**3:.1f} GB)")
+        print(f"[Data] {kind}: {C} Kameras x {F} Frames geladen ({images.numel() / 1024**3:.1f} GB)")
         return images
 
     def frame_points(self, frame: int) -> Tuple[np.ndarray, np.ndarray]:
