@@ -21,6 +21,7 @@ Alles, was von anderen stammt und hier verwendet wird:
   - Rasterisierer, SH-Auswertung und PLY-Export werden aus `gsplat` importiert, COLMAP-Parser und Hilfsfunktionen (`knn`, `rgb_to_sh`, `set_random_seed`) unverändert aus `gsplat/examples` (`datasets/`, `utils.py`).
 - **FreeTimeGsVanilla (AGPL-3.0)**, [OpsiClear-4DGS/FreeTimeGsVanilla](https://github.com/OpsiClear-4DGS/FreeTimeGsVanilla): nur als Referenz ausgeführt und gelesen (`scripts/run_vanilla_ref.sh`), kein Code übernommen. Das Datenlayout (`images/camXX/`, `points/`) folgt seinem Format, damit beide dieselben Daten lesen.
 - **BiRefNet (MIT)**, P. Zheng et al., *Bilateral Reference for High-Resolution Dichotomous Image Segmentation*, CAAI AIR 2024. Modell [`ZhengPeng7/BiRefNet`](https://huggingface.co/ZhengPeng7/BiRefNet), Revision `e2bf8e4` (dieselbe wie in 4DAnyone). `scripts/prepare_4danyone.py` lädt es über Hugging Face transformers (der Modellcode kommt per `trust_remote_code` aus dem Modell-Repository) und berechnet damit die Vordergrundmasken.
+- **RAFT (BSD-3, torchvision)**, Z. Teed und J. Deng, *RAFT: Recurrent All-Pairs Field Transforms for Optical Flow*, ECCV 2020. `scripts/estimate_velocities.py` nutzt `torchvision.models.optical_flow.raft_large` mit den vortrainierten Gewichten `Raft_Large_Weights.DEFAULT` (C_T_SKHT_V2) für den 2D-Fluss zwischen aufeinanderfolgenden Frames; die Umrechnung in 3D-Geschwindigkeiten pro Punkt ist eigener Code.
 
 **Werkzeuge und Bibliotheken**
 - COLMAP (Kameraposen, Triangulation), ffmpeg (Frames aus Videos)

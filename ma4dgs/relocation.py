@@ -20,7 +20,7 @@ Aufbau angelehnt an gsplat/strategy/ops.py (relocate), Apache-2.0.
 """
 
 import math
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -37,10 +37,27 @@ class Relocator:
         lambda_grad: float = 0.5,
         lambda_opa: float = 0.5,
         min_opacity: float = 5e-3,
+        time_range: Optional[Tuple[float, float]] = None,
+        cull_threshold: float = 1e-3,
+        max_frac: float = 1.0,
     ):
+        """time_range: (t_min, t_max) der Sequenz. Wenn gesetzt, gelten auch
+        Gaußsche als tot, deren zeitliche Opazität σ(t) innerhalb der Sequenz
+        nie über cull_threshold kommt (μₜ zu weit außerhalb): Sie werden nie
+        gerendert, erhalten keinen Gradienten und würden sonst dauerhaft
+        Budget binden (im 48Views-Lauf 6 % nach 30k, 11 % nach 90k Schritten).
+        """
         self.lambda_grad = lambda_grad
         self.lambda_opa = lambda_opa
         self.min_opacity = min_opacity
+        self.time_range = time_range
+        self.cull_threshold = cull_threshold
+        # Höchstens dieser Anteil aller Gaußschen wird pro Runde verschoben
+        # (Vanilla: 10 %). Verhindert, dass nach einem Massensterben (z. B. durch
+        # die 4D-Regularisierung) wenige Überlebende massenhaft geklont werden
+        # und das Modell in dauerhaft sichtbare Gaußsche kippt.
+        self.max_frac = max_frac
+        self.n_dead_time = 0
         self.grad2d = torch.zeros(num_gaussians, device=device)
         self.count = torch.zeros(num_gaussians, device=device)
         n_max = 51
@@ -69,15 +86,40 @@ class Relocator:
         return self.lambda_grad * g + self.lambda_opa * opa
 
     @torch.no_grad()
-    def step(self, splats, optimizers: Dict[str, torch.optim.Optimizer]) -> int:
-        """Tote Gaußsche verschieben, Akkumulatoren zurücksetzen. Rückgabe: Anzahl."""
+    def step(
+        self,
+        splats,
+        optimizers: Dict[str, torch.optim.Optimizer],
+        target_weight: Optional[Tensor] = None,
+    ) -> int:
+        """Tote Gaußsche verschieben, Akkumulatoren zurücksetzen. Rückgabe: Anzahl.
+
+        target_weight [N]: optionaler Faktor auf den Score bei der Zielwahl,
+        z. B. der Bildfehler zur Zeit μₜ der Gaußschen (zeitliche Gewichtung).
+        """
         opa = torch.sigmoid(splats["opacities"])
         dead = opa <= self.min_opacity
+        self.n_dead_time = 0
+        if self.time_range is not None:
+            t_min, t_max = self.time_range
+            mu = splats["times"].squeeze(-1)
+            s = torch.exp(splats["durations"]).squeeze(-1)
+            dist = torch.clamp(t_min - mu, min=0) + torch.clamp(mu - t_max, min=0)
+            never_visible = torch.exp(-0.5 * (dist / s) ** 2) < self.cull_threshold
+            self.n_dead_time = int((never_visible & ~dead).sum())
+            dead = dead | never_visible
         n = int(dead.sum())
         if n > 0 and n < len(dead):
             dead_idx = dead.nonzero(as_tuple=True)[0]
             alive_idx = (~dead).nonzero(as_tuple=True)[0]
+            n_max = int(self.max_frac * len(dead))
+            if n > n_max:
+                # die am wenigsten sichtbaren zuerst
+                dead_idx = dead_idx[torch.argsort(opa[dead_idx])[:n_max]]
+                n = n_max
             probs = self.score(splats)[alive_idx]
+            if target_weight is not None:
+                probs = probs * target_weight[alive_idx]
             sampled = alive_idx[_multinomial_sample(probs, n, replacement=True)]
             new_opa, new_scales = compute_relocation(
                 opacities=opa[sampled],

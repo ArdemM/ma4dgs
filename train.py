@@ -66,6 +66,11 @@ class Config:
     keyframe_step: int = 1
     # Anfangsdauer s in normierter Zeit; None = 2 × Keyframe-Abstand
     init_duration: Optional[float] = None
+    # Untergrenze der Dauer s in Frames (0 = keine). Wird nach jedem Schritt
+    # durch Klemmen von log s erzwungen (Vanilla: min 0.02 normiert ≈ 2,4
+    # Frames). Ohne Untergrenze weicht das Modell bei schneller Bewegung in
+    # „3DGS pro Frame“ aus (s ≈ 1,4 Frames, v → 0) statt v zu lernen.
+    min_duration_frames: float = 0.0
     init_opacity: float = 0.1
     init_scale: float = 1.0
     sh_degree: int = 3
@@ -87,7 +92,9 @@ class Config:
     # Geschwindigkeit optimieren (False = statische Gaußsche, nur zeitlich begrenzt)
     learn_velocity: bool = True
     # Anfangsgeschwindigkeit: 0 oder k-NN-Zuordnung zum nächsten Keyframe
-    init_velocity: Literal["zero", "knn"] = "zero"
+    # knn_centroid: kNN nach Ausgleich der Schwerpunktverschiebung (siehe knn_velocities)
+    # file: points/velocities_frameNNNNNN.npy aus optischem Fluss (scripts/estimate_velocities.py)
+    init_velocity: Literal["zero", "knn", "knn_centroid", "file"] = "zero"
     knn_k: int = 3
 
     # 4D-Regularisierung (Gl. 6): λ_reg · mean(σ · sg[σ(t)]), nur bis reg_until
@@ -103,6 +110,17 @@ class Config:
     reloc_min_opacity: float = 5e-3
     reloc_lambda_grad: float = 0.5
     reloc_lambda_opa: float = 0.5
+    # Gaußsche, die zeitlich ganz außerhalb der Sequenz liegen (nie gerendert,
+    # kein Gradient), ebenfalls als tot behandeln und verschieben
+    reloc_outside_dead: bool = False
+    # Obergrenze des Anteils der pro Runde verschobenen Gaußschen (1.0 = alle toten)
+    reloc_max_frac: float = 1.0
+    # Zielwahl der Relokation zeitlich gewichten: Score × (Bildfehler des Frames
+    # bei μₜ / mittlerer Bildfehler)^reloc_time_power. Der Fehler pro Frame ist
+    # ein gleitender Mittelwert (EMA) des Bildlosses der Trainingsschritte.
+    reloc_time_weight: bool = False
+    reloc_time_power: float = 1.0
+    reloc_err_ema: float = 0.1
 
     # Rendering-Loss (Gl. 5): λ_img·L_img + λ_ssim·(1 − SSIM) + λ_perc·LPIPS
     img_loss: Literal["l1", "l2"] = "l1"
@@ -170,7 +188,13 @@ class Runner:
             init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
             sh_degree=cfg.sh_degree,
-            velocities=knn_velocities(frames, cfg.knn_k) if cfg.init_velocity == "knn" else None,
+            velocities=(
+                [self.data.frame_velocities(f) for f in keyframes]
+                if cfg.init_velocity == "file"
+                else knn_velocities(frames, cfg.knn_k, align_centroid=cfg.init_velocity == "knn_centroid")
+                if cfg.init_velocity != "zero"
+                else None
+            ),
         )
         self.splats = torch.nn.ParameterDict(
             {k: torch.nn.Parameter(v) for k, v in init.items()}
@@ -188,6 +212,10 @@ class Runner:
                 lambda_grad=cfg.reloc_lambda_grad,
                 lambda_opa=cfg.reloc_lambda_opa,
                 min_opacity=cfg.reloc_min_opacity,
+                time_range=(float(self.data.times[0]), float(self.data.times[-1]))
+                if cfg.reloc_outside_dead
+                else None,
+                max_frac=cfg.reloc_max_frac,
             )
             if cfg.relocate
             else None
@@ -285,6 +313,16 @@ class Runner:
         )
         items = self.data.train_items
         rng = np.random.default_rng(cfg.seed)
+        log_s_min = (
+            math.log(cfg.min_duration_frames / max(self.data.num_frames - 1, 1))
+            if cfg.min_duration_frames > 0
+            else None
+        )
+        if log_s_min is not None:
+            with torch.no_grad():
+                self.splats["durations"].clamp_(min=log_s_min)
+        # Bildfehler pro Frame (EMA), NaN = noch nicht gesehen
+        frame_err = torch.full((self.data.num_frames,), float("nan"), device=self.device)
 
         torch.cuda.reset_peak_memory_stats()
         tic = time.time()
@@ -312,6 +350,9 @@ class Runner:
             else:
                 imgloss = torch.nn.functional.mse_loss(colors, pixels)
             ssimloss = ssim_loss(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2))
+            if cfg.reloc_time_weight:
+                e = imgloss.detach()
+                frame_err[frame] = e if torch.isnan(frame_err[frame]) else (1 - cfg.reloc_err_ema) * frame_err[frame] + cfg.reloc_err_ema * e
             loss = cfg.lambda_img * imgloss + cfg.lambda_ssim * ssimloss
             if cfg.lambda_perc > 0:
                 lpipsloss = self.lpips(
@@ -337,14 +378,25 @@ class Runner:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             scheduler.step()
+            if log_s_min is not None:
+                with torch.no_grad():
+                    self.splats["durations"].clamp_(min=log_s_min)
 
             if (
                 self.relocator is not None
                 and cfg.reloc_start <= step + 1 <= cfg.reloc_stop
                 and (step + 1) % cfg.reloc_every == 0
             ):
-                n_reloc = self.relocator.step(self.splats, self.optimizers)
+                target_weight = None
+                if cfg.reloc_time_weight:
+                    err = torch.nan_to_num(frame_err, nan=float(torch.nanmean(frame_err)))
+                    err = err / err.mean()
+                    fr = (self.splats["times"].detach().squeeze(-1).clamp(0, 1) * (self.data.num_frames - 1)).round().long()
+                    target_weight = err[fr] ** cfg.reloc_time_power
+                    self.writer.add_scalar("reloc/frame_err_max_over_min", (err.max() / err.min()).item(), step)
+                n_reloc = self.relocator.step(self.splats, self.optimizers, target_weight=target_weight)
                 self.writer.add_scalar("gauss/relocated", n_reloc, step)
+                self.writer.add_scalar("gauss/relocated_outside_time", self.relocator.n_dead_time, step)
 
             if step % cfg.tb_every == 0:
                 pbar.set_description(f"loss={loss.item():.3f} sh={sh_degree} sichtbar={int(mask.sum())}")

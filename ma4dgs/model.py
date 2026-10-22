@@ -23,13 +23,21 @@ from utils import knn, rgb_to_sh  # gsplat/examples/utils.py
 
 
 def knn_velocities(
-    frames: List[Tuple[np.ndarray, np.ndarray, float]], k: int = 3
+    frames: List[Tuple[np.ndarray, np.ndarray, float]], k: int = 3, align_centroid: bool = False
 ) -> List[np.ndarray]:
     """Geschwindigkeit pro Punkt aus k-NN-Zuordnung zum nächsten Keyframe (Abschnitt 3.2).
 
     v = (Mittel der k nächsten Nachbarn im nächsten Keyframe − p) / Δt.
     Der letzte Keyframe nimmt die Rückwärtsdifferenz zum vorherigen.
     Rückgabe: eine Liste [M, 3] pro Keyframe (Weltkoordinaten pro Zeiteinheit).
+
+    align_centroid: Vor der Zuordnung die Punktwolke um die Schwerpunkt-
+    verschiebung zum nächsten Keyframe versetzen und diese zur Geschwindigkeit
+    addieren. Grund: Bei Bewegung entlang der eigenen Oberfläche (Körper
+    springt nach oben, Rumpf und Beine sind senkrechte Flächen) findet die
+    Nächste-Nachbar-Zuordnung den Punkt *auf derselben Fläche* und
+    unterschätzt die Bewegung stark (Seilspringen: Schwerpunkt 4 cm/Frame,
+    kNN-Fluss 0,3 cm/Frame). Die globale Verschiebung wird so vorab erfasst.
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -39,8 +47,9 @@ def knn_velocities(
     for i, (pts, _, t) in enumerate(frames):
         j = i + 1 if i + 1 < len(frames) else i - 1
         other, _, t_other = frames[j]
+        shift = (other.mean(axis=0) - pts.mean(axis=0)) if align_centroid else np.zeros(3)
         nn = NearestNeighbors(n_neighbors=k).fit(other)
-        _, idx = nn.kneighbors(pts)
+        _, idx = nn.kneighbors(pts + shift)
         target = other[idx].mean(axis=1)  # [M, 3]
         vels.append(((target - pts) / (t_other - t)).astype(np.float32))
     return vels

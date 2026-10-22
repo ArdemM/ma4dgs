@@ -114,5 +114,14 @@ class MultiViewVideo:
         pts = transform_points(self.transform, pts.astype(np.float64)).astype(np.float32)
         return pts, (rgb.astype(np.float32) / 255.0)
 
+    def frame_velocities(self, frame: int) -> np.ndarray:
+        """Startgeschwindigkeit [M, 3] eines Frames (scripts/estimate_velocities.py),
+        in das normalisierte Weltkoordinatensystem gedreht und skaliert (nur der
+        lineare Teil der Ähnlichkeitstransformation, keine Verschiebung)."""
+        path = self.scene_dir / "points" / f"velocities_frame{frame:06d}.npy"
+        assert path.exists(), f"{path} fehlt: scripts/estimate_velocities.py ausführen"
+        vel = np.load(path).astype(np.float64)
+        return (vel @ self.transform[:3, :3].T).astype(np.float32)
+
     def keyframes(self, step: int) -> List[int]:
         return list(range(0, self.num_frames, step))
