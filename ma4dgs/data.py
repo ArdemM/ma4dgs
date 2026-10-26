@@ -5,6 +5,7 @@
     <szene>/frame0/                  images/camXX.png + sparse -> ../sparse
     <szene>/points/                  Punktwolken pro Frame (scripts/triangulate_frames.py)
     <szene>/masks/camXX/NNNNN.png    optional: Vordergrundmasken 0–255 (scripts/prepare_4danyone.py)
+    <szene>/skeleton/                optional: 3D-Skelett pro Frame (scripts/prepare_4danyone.py)
 
 Die Kameras stehen still, deshalb werden Posen und Intrinsics einmal mit dem
 COLMAP-Parser aus gsplat/examples auf frame0/ gelesen (inkl. Normalisierung
@@ -13,6 +14,7 @@ ursprünglichen COLMAP-Koordinaten und werden mit derselben Transformation
 normalisiert.
 """
 
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -113,6 +115,27 @@ class MultiViewVideo:
         rgb = np.load(self.scene_dir / "points" / f"colors_frame{frame:06d}.npy")
         pts = transform_points(self.transform, pts.astype(np.float64)).astype(np.float32)
         return pts, (rgb.astype(np.float32) / 255.0)
+
+    @property
+    def meter(self) -> float:
+        """Länge von 1 m (bzw. 1 Einheit der COLMAP-Koordinaten) nach der Normalisierung."""
+        return float(np.linalg.norm(self.transform[:3, 0]))
+
+    def skeleton(self) -> Tuple[np.ndarray, List[str]]:
+        """3D-Skelett im normalisierten Weltkoordinatensystem.
+
+        Rückgabe: Punkte [F, K, 3] float32, Punktnamen [K] (Goliath, aus 4DAnyone).
+        """
+        d = self.scene_dir / "skeleton"
+        assert (d / "keypoints3d.npy").exists(), (
+            f"{d}/keypoints3d.npy fehlt: scripts/prepare_4danyone.py mit conditioning/ der 4DAnyone-Ausgabe"
+        )
+        kp = np.load(d / "keypoints3d.npy").astype(np.float64)[: self.num_frames]
+        assert len(kp) == self.num_frames, f"Skelett hat {len(kp)} Frames, Szene {self.num_frames}"
+        names = json.loads((d / "keypoint_names.json").read_text())
+        F, K, _ = kp.shape
+        kp = transform_points(self.transform, kp.reshape(-1, 3)).reshape(F, K, 3)
+        return kp.astype(np.float32), names
 
     def keyframes(self, step: int) -> List[int]:
         return list(range(0, self.num_frames, step))

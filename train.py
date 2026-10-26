@@ -12,6 +12,9 @@
 #   --relocate                   periodische Relokation (Gl. 7, ma4dgs/relocation.py)
 #   --init-velocity knn          k-NN-Geschwindigkeit zwischen Keyframes
 #   --velocities-lr-final 5e-5   Velocity-Annealing
+# Eigene Erweiterung für 4DAnyone-Szenen mit skeleton/ (ma4dgs/skeleton.py):
+#   --init-velocity skeleton     Startgeschwindigkeit aus dem 3D-Skelett
+#   --lambda-skel 1e-2           Geschwindigkeit zum Skelett hin regularisieren
 #
 # Aufruf:
 #   python train.py --data-dir ~/masterarbeit/data/n3dv/flame_steak_50f \
@@ -40,6 +43,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from ma4dgs.data import MultiViewVideo
 from ma4dgs.model import gaussians_at, init_from_frames, knn_velocities, temporal_opacity
 from ma4dgs.relocation import Relocator
+from ma4dgs.skeleton import SkeletonPrior
 from datasets.traj import focus_point_fn, viewmatrix  # gsplat/examples
 from gsplat.losses import l1_loss, ssim_loss
 from gsplat.rendering import rasterization
@@ -86,9 +90,19 @@ class Config:
     velocities_lr_final: Optional[float] = None
     # Geschwindigkeit optimieren (False = statische Gaußsche, nur zeitlich begrenzt)
     learn_velocity: bool = True
-    # Anfangsgeschwindigkeit: 0 oder k-NN-Zuordnung zum nächsten Keyframe
-    init_velocity: Literal["zero", "knn"] = "zero"
+    # Anfangsgeschwindigkeit: 0, k-NN-Zuordnung zum nächsten Keyframe oder aus dem
+    # 3D-Skelett der Szene (skeleton/, ma4dgs/skeleton.py)
+    init_velocity: Literal["zero", "knn", "skeleton"] = "zero"
     knn_k: int = 3
+
+    # Skelett-Prior (eigene Erweiterung): λ_skel · Σ w·|v − v_skel| / Σ w über die zum
+    # Zeitpunkt t aktiven Gaußschen, |·| in cm pro Frame, w = Konfidenz · sg[σ(t)].
+    # v_skel wird an der Position zum Zeitpunkt t abgefragt (ohne Gradient).
+    lambda_skel: float = 0.0
+    # Zuordnung Punkt → Knochen (softmax über −d²/2σ²) und Abfall der Konfidenz
+    # exp(−d²/2τ²) mit dem Abstand zum Skelett, beides in Metern
+    skel_sigma: float = 0.05
+    skel_tau: float = 0.1
 
     # 4D-Regularisierung (Gl. 6): λ_reg · mean(σ · sg[σ(t)]), nur bis reg_until
     # ("frühe Trainingsphase", Länge im Paper nicht angegeben)
@@ -162,15 +176,32 @@ class Runner:
             self.init_duration = 2.0 * cfg.keyframe_step / max(F - 1, 1)
         else:
             self.init_duration = cfg.init_duration
+        # Geschwindigkeit pro normierter Zeiteinheit -> cm pro Frame
+        self.v_to_cm = 100.0 / (max(F - 1, 1) * self.data.meter)
+        self.skeleton = None
+        if cfg.init_velocity == "skeleton" or cfg.lambda_skel > 0:
+            self.skeleton = SkeletonPrior(
+                *self.data.skeleton(), self.data.times, self.data.meter,
+                sigma=cfg.skel_sigma, tau=cfg.skel_tau, device=self.device,
+            )
         keyframes = self.data.keyframes(cfg.keyframe_step)
         frames = [(*self.data.frame_points(f), self.data.times[f]) for f in keyframes]
+        if cfg.init_velocity == "knn":
+            velocities = knn_velocities(frames, cfg.knn_k)
+        elif cfg.init_velocity == "skeleton":
+            velocities = [
+                self.skeleton.query(torch.from_numpy(pts).to(self.device), float(t))[0].cpu().numpy()
+                for pts, _, t in frames
+            ]
+        else:
+            velocities = None
         init = init_from_frames(
             frames,
             init_duration=self.init_duration,
             init_opacity=cfg.init_opacity,
             init_scale=cfg.init_scale,
             sh_degree=cfg.sh_degree,
-            velocities=knn_velocities(frames, cfg.knn_k) if cfg.init_velocity == "knn" else None,
+            velocities=velocities,
         )
         self.splats = torch.nn.ParameterDict(
             {k: torch.nn.Parameter(v) for k, v in init.items()}
@@ -179,7 +210,8 @@ class Runner:
         print(
             f"Init: {len(keyframes)} Keyframes, {len(self.splats['means'])} Gaußsche, "
             f"Dauer s = {self.init_duration:.4f}, "
-            f"|v| Median {self.splats['velocities'].norm(dim=-1).median().item():.4f}"
+            f"|v| Median {self.splats['velocities'].norm(dim=-1).median().item():.4f} "
+            f"({self.splats['velocities'].norm(dim=-1).median().item() * self.v_to_cm:.2f} cm/Frame)"
         )
         self.relocator = (
             Relocator(
@@ -328,6 +360,16 @@ class Runner:
                 temp = temporal_opacity(self.splats, t).detach()
                 regloss = (torch.sigmoid(self.splats["opacities"]) * temp).mean()
                 loss = loss + cfg.lambda_reg * regloss
+            skelloss = None
+            if cfg.lambda_skel > 0:
+                v = self.splats["velocities"][mask]
+                with torch.no_grad():
+                    x = self.splats["means"][mask] + v * (t - self.splats["times"][mask])
+                    v_skel, conf = self.skeleton.query(x, t)
+                    w = conf * temporal_opacity(self.splats, t)[mask]
+                diff = (v - v_skel).norm(dim=-1) * self.v_to_cm
+                skelloss = (w * diff).sum() / w.sum().clamp_min(1e-8)
+                loss = loss + cfg.lambda_skel * skelloss
             loss.backward()
 
             if self.relocator is not None:
@@ -356,6 +398,8 @@ class Runner:
                     w.add_scalar("train/regloss", regloss.item(), step)
                 if maskloss is not None:
                     w.add_scalar("train/maskloss", maskloss.item(), step)
+                if skelloss is not None:
+                    w.add_scalar("train/skelloss_cm", skelloss.item(), step)
                 if "velocities" in self.optimizers:
                     w.add_scalar("train/velocities_lr", self.optimizers["velocities"].param_groups[0]["lr"], step)
                 w.add_scalar("train/visible_GS", int(mask.sum()), step)

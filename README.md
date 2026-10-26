@@ -29,10 +29,11 @@ Alles, was von anderen stammt und hier verwendet wird:
 
 **Methoden für generierte Ansichten** (`scripts/prepare_4danyone.py`)
 - **Visual Hull / Space Carving**: A. Laurentini, *The Visual Hull Concept for Silhouette-Based Image Understanding*, IEEE TPAMI 1994. Eigene Umsetzung zur Initialisierung pro Frame.
+- **3D-Skelett aus 4DAnyone** (Skelett-Prior, `ma4dgs/skeleton.py`): Die Punkte (`conditioning/keypoints_3d.npy`) erzeugt 4DAnyone, hier werden sie nur gelesen. Dahinter stehen **GVHMR** (Z. Shen et al., *World-Grounded Human Motion Recovery via Gravity-View Coordinates*, SIGGRAPH Asia 2024), das aus dem Eingabevideo eine **SMPL-X**-Sequenz schätzt (G. Pavlakos et al., *Expressive Body Capture: 3D Hands, Face, and Body from a Single Image*, CVPR 2019), und ein Regressor von 4DAnyone auf die 70 Punkte des **Goliath**-Schemas (R. Khirodkar et al., *Sapiens2*, ICLR 2026). Die Liste der Knochen in `ma4dgs/skeleton.py` folgt den Verbindungen, die 4DAnyone für sein Goliath40-Skelett zeichnet (`fdanyone/skeleton/keypoints.py`), ohne Fingerglieder, plus Hals–Nase und Augen-Querverbindung. Geschwindigkeitsfeld, Konfidenz und Regularisierung sind eigene Erweiterung.
 
 **Daten**
 - **Neural3DV / DyNeRF**: T. Li et al., *Neural 3D Video Synthesis from Multi-view Video*, CVPR 2022 (Meta). Szene `flame_steak`.
-- **4DAnyone** (AntResearch, Apache-2.0), [ant-research/4DAnyone](https://github.com/ant-research/4DAnyone): erzeugt aus einem eigenen Video synchrone Ansichten mit Kameras (`cameras.json`, `videos/dense/`). Ausgeführt auf einem anderen Rechner; hier wird nur seine Ausgabe gelesen.
+- **4DAnyone** (AntResearch, Apache-2.0), Y. Jin, T. Xie et al., *4DAnyone: Create Anyone in 4D from a Casual Monocular Video*, arXiv 2608.20335, 2026, [ant-research/4DAnyone](https://github.com/ant-research/4DAnyone): erzeugt aus einem eigenen Video synchrone Ansichten mit Kameras (`cameras.json`, `videos/dense/`). Ausgeführt auf einem anderen Rechner; hier wird nur seine Ausgabe gelesen.
 
 **KI-Unterstützung**
 - Code und Dokumentation sind mit Unterstützung von KI entstanden (Claude Code, Anthropic). Commits mit KI-Beteiligung tragen die Zeile `Co-Authored-By: Claude`.
@@ -49,7 +50,7 @@ cd ~/masterarbeit/ma4dgs     # Python nie in ~/masterarbeit selbst starten
 | Pfad | Inhalt |
 |---|---|
 | `train.py` | eigener FreeTimeGS-Trainer (Konfiguration: `python train.py --help`) |
-| `ma4dgs/` | Datensatz (`data.py`) und 4D-Repräsentation (`model.py`) |
+| `ma4dgs/` | Datensatz (`data.py`), 4D-Repräsentation (`model.py`), Relokation (`relocation.py`), Skelett-Prior (`skeleton.py`) |
 | `scripts/` | Datenvorbereitung, Lauf-Skripte |
 | `~/masterarbeit/data/n3dv/raw/<szene>/` | Original-Videos Neural3DV (`camXX.mp4`, `poses_bounds.npy`) |
 | `~/masterarbeit/data/n3dv/<szene>_<N>f/` | vorbereitete Szene (siehe unten) |
@@ -146,6 +147,11 @@ python scripts/view_4d.py --ckpt ~/masterarbeit/results/4danyone/<name>/ckpts/ck
 Frames (ffmpeg), Masken (BiRefNet), Punktwolke pro Frame als Visual Hull aus Masken und bekannten Kameras (statt SIFT-Triangulation), COLMAP-Modell direkt aus `cameras.json` (ohne COLMAP-Lauf).
 Die Welt wird dabei von y-oben auf z-oben gedreht: Mit exakt +y als Oben-Richtung spiegelt `similarity_from_cameras` aus gsplat/examples die Szene, statt sie zu drehen.
 Mit Masken lernt `train.py` nur den Vordergrund (`--background random|black|white`, `--lambda-mask`); `run_4danyone.sh` setzt das zusammen mit dem vollen Modell, `--test-cams` ohne Wert (alle Kameras trainieren) und `--traj-mode orbit`.
+
+### Skelett-Prior (eigene Erweiterung, Branch `fast-motion-skeleton`)
+
+4DAnyone rendert seine Skelett-Videos aus 3D-Punkten (`keypoints_3d.npy`), die es in einem versteckten Arbeitsordner neben der Ausgabe ablegt: `.<clip>.scratch-XXXXXXXX/conditioning/`. Er wird normalerweise am Ende gelöscht und bleibt nur stehen, wenn das Aufräumen scheitert. Liegt dieser `conditioning/`-Ordner in der 4DAnyone-Ausgabe (`--src`), übernimmt `prepare_4danyone.py` die Punkte nach `skeleton/` (Schritt 5; mit `--skip-frames --skip-masks --skip-hull` auch nachträglich).
+`train.py --init-velocity skeleton` startet jede Gaußsche mit der Skelett-Geschwindigkeit an ihrer Position, `--lambda-skel` zieht die gelernte Geschwindigkeit während des ganzen Trainings dorthin (Abweichung in cm pro Frame, gewichtet mit der Nähe zum Skelett). `scripts/diag_skeleton.py <result_dir> ...` vergleicht gelernte und Skelett-Geschwindigkeit und zeigt PSNR/LPIPS getrennt nach ruhiger Phase und Sprung.
 
 ## Referenz: FreeTimeGsVanilla
 

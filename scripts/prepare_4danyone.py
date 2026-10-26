@@ -14,15 +14,22 @@ export_ply.py work unchanged:
      SIFT triangulation is unreliable on few, wide-baseline, generated views.
   4. COLMAP model: sparse/0 (PINHOLE, poses from cameras.json, frame-0 hull as
      points3D) and frame0/, without running COLMAP.
+  5. Skeleton (only if <src>/conditioning/ exists): the 3D keypoints 4DAnyone
+     renders its skeleton videos from (GVHMR -> SMPL-X -> 70 Goliath keypoints),
+     rotated into the frame of points/ -> skeleton/ (train.py --init-velocity
+     skeleton, --lambda-skel).
 
 Input (4DAnyone output):
     <src>/cameras.json            K, camera_to_world (OpenCV), image size per camera
     <src>/videos/dense/XX.mp4     one video per camera_id
     <src>/metadata.json           (copied to meta.json for reference)
+    <src>/conditioning/           optional: keypoints_3d.npy, metadata.json, cameras.json from
+                                  4DAnyone's hidden scratch folder .<clip>.scratch-XXXXXXXX/
 
 Output:
     <out>/images/camXX/NNNNN.png, masks/camXX/NNNNN.png, points/*.npy,
-    sparse/0/{cameras,images,points3D}.txt, frame0/, meta.json
+    sparse/0/{cameras,images,points3D}.txt, frame0/, meta.json,
+    skeleton/{keypoints3d.npy,keypoint_names.json}
 
 Example:
     python scripts/prepare_4danyone.py \
@@ -276,6 +283,30 @@ def make_frame0(out: Path, cams: list[dict]) -> None:
     (frame0 / "sparse").symlink_to("../sparse")
 
 
+# --- 5. Skeleton -------------------------------------------------------------------------------
+
+def copy_skeleton(src: Path, out: Path, num_frames: int) -> dict:
+    cond = src / "conditioning"
+    kp = np.load(cond / "keypoints_3d.npy").astype(np.float64)  # [F, 70, 3], 4DAnyone world
+    names = json.loads((cond / "metadata.json").read_text())["keypoint_names"]
+    assert kp.shape[1:] == (len(names), 3), (kp.shape, len(names))
+    assert len(kp) >= num_frames, f"skeleton has {len(kp)} frames, videos {num_frames}"
+    # The keypoints are in the world of conditioning/cameras.json; it must be the world of the videos.
+    ref = json.loads((src / "cameras.json").read_text())["cameras"]
+    cond_cams = json.loads((cond / "cameras.json").read_text())["cameras"]
+    diff = max(np.abs(np.array(a["camera_to_world"]) - np.array(b["camera_to_world"])).max()
+               for a, b in zip(ref, cond_cams, strict=True))
+    assert diff < 1e-6, f"conditioning/cameras.json does not match cameras.json (max diff {diff})"
+    kp = kp[:num_frames] @ Y_UP_TO_Z_UP[:3, :3].T
+    (out / "skeleton").mkdir(exist_ok=True)
+    np.save(out / "skeleton" / "keypoints3d.npy", kp.astype(np.float32))
+    (out / "skeleton" / "keypoint_names.json").write_text(json.dumps(names))
+    speed = np.linalg.norm(np.diff(kp, axis=0), axis=-1).max(axis=1) * 100
+    print(f"  {kp.shape[1]} keypoints x {len(kp)} frames, fastest keypoint per frame: "
+          f"median {np.median(speed):.2f} cm, max {speed.max():.2f} cm (frame {speed.argmax()})")
+    return {"source": str(cond / "keypoints_3d.npy"), "num_keypoints": len(names), "frames": len(kp)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", type=Path, required=True, help="4DAnyone output folder (with cameras.json)")
@@ -303,7 +334,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_frames:
-        print("[1/4] frames")
+        print("[1/5] frames")
         with ThreadPoolExecutor(args.workers) as pool:
             counts = list(pool.map(lambda c: extract_frames(c["video"], out / "images" / c["name"], args.num_frames), cams))
         if len(set(counts)) != 1:
@@ -311,16 +342,23 @@ def main() -> None:
     num_frames = min(len(list((out / "images" / c["name"]).glob("*.png"))) for c in cams)
 
     if not args.skip_masks:
-        print(f"[2/4] masks (BiRefNet, {len(cams) * num_frames} images)")
+        print(f"[2/5] masks (BiRefNet, {len(cams) * num_frames} images)")
         compute_masks(out, cams, num_frames, args.mask_batch)
 
     if not args.skip_hull:
-        print(f"[3/4] visual hull, {num_frames} frames")
+        print(f"[3/5] visual hull, {num_frames} frames")
         build_points(out, cams, num_frames, args)
 
-    print("[4/4] COLMAP model + frame0")
+    print("[4/5] COLMAP model + frame0")
     write_colmap(out, cams)
     make_frame0(out, cams)
+
+    skeleton = None
+    if (src / "conditioning" / "keypoints_3d.npy").exists():
+        print("[5/5] skeleton (conditioning/keypoints_3d.npy)")
+        skeleton = copy_skeleton(src, out, num_frames)
+    else:
+        print("[5/5] skeleton: no conditioning/keypoints_3d.npy in --src, skipped")
 
     meta = {
         "source": str(src),
@@ -331,6 +369,7 @@ def main() -> None:
         "masks": f"{BIREFNET_REPO}@{BIREFNET_REVISION}",
         "hull": {"res": args.hull_res, "tolerance": args.hull_tolerance, "mask_thresh": args.mask_thresh,
                  "points_per_frame": args.points_per_frame},
+        "skeleton": skeleton,
     }
     if (src / "metadata.json").exists():
         meta["4danyone"] = json.loads((src / "metadata.json").read_text())
