@@ -2,7 +2,8 @@
 
 Für jeden Ergebnisordner (train.py mit 4DAnyone-Szene, skeleton/ im Datensatz):
   - PSNR/LPIPS der Testkameras gemittelt über Frame-Bereiche (stats/val_step*.json),
-    Standard: ruhig 0–39, Sprung 50–70, alle;
+    Standard: ruhig 0–39, Fenster 45–75, Sprung 50–70, Frame 60, alle (Frame-Nummern der
+    Sequenz; Läufe auf einem Zeitfenster nur mit den Phasen, die im Fenster liegen);
   - für einzelne Frames aus ckpts/ckpt_final.pt: Gaußsche mit σ(t) > 0,5 und
     Skelett-Konfidenz > 0,5, davon Median |v|, Median der Skelett-Geschwindigkeit
     an ihrer Position, Median |v − v_skel| (alles in cm pro Frame), Median der
@@ -42,33 +43,36 @@ def phase_metrics(result_dir: Path, phases):
     out = {}
     for name, (f0, f1) in phases.items():
         sel = [r for r in rows if f0 <= r["frame"] <= f1]
-        out[name] = (np.mean([r["psnr"] for r in sel]), np.mean([r["lpips"] for r in sel]))
+        if sel:  # Zeitfenster enthalten nicht jede Phase
+            out[name] = (np.mean([r["psnr"] for r in sel]), np.mean([r["lpips"] for r in sel]))
     return out
 
 
 @torch.no_grad()
 def velocity_stats(result_dir: Path, frames, scenes: dict):
     cfg = yaml.safe_load(open(result_dir / "cfg.yml"))
-    key = cfg["data_dir"]
+    key = (cfg["data_dir"], cfg["num_frames"], cfg.get("frame_start"))
     if key not in scenes:
-        data = SceneGeometry(key, test_cams=[], num_frames=cfg["num_frames"])
+        data = SceneGeometry(key[0], test_cams=[], num_frames=key[1], frame_start=key[2])
         prior = SkeletonPrior(*data.skeleton(), data.times, data.meter,
                               sigma=cfg.get("skel_sigma", 0.05), tau=cfg.get("skel_tau", 0.1))
         scenes[key] = (data, prior)
     data, prior = scenes[key]
-    F = data.num_frames
-    to_cm = 100.0 / ((F - 1) * data.meter)
+    to_cm = 100.0 / (data.frames_per_unit * data.meter)
     sp = torch.load(result_dir / "ckpts" / "ckpt_final.pt", map_location="cuda", weights_only=False)["splats"]
     out = {}
     for f in frames:
-        t = float(data.times[f])
+        # f ist die Frame-Nummer der Sequenz; bei Zeitfenstern nur Frames im Fenster
+        if not 0 <= f - data.frame_start < data.num_frames:
+            continue
+        t = float(data.times[f - data.frame_start])
         active = temporal_opacity(sp, t) > 0.5
         v = sp["velocities"][active]
         x = sp["means"][active] + v * (t - sp["times"][active])
         v_skel, conf = prior.query(x, t)
         near = conf > 0.5
         v, v_skel = v[near], v_skel[near]
-        dur = torch.exp(sp["durations"][active][near]).squeeze(-1) * (F - 1)
+        dur = torch.exp(sp["durations"][active][near]).squeeze(-1) * data.frames_per_unit
         out[f] = {
             "n": int(near.sum()),
             "v": float(v.norm(dim=-1).median() * to_cm),
@@ -84,7 +88,8 @@ def main():
     ap.add_argument("result_dirs", nargs="+")
     ap.add_argument("--frames", type=int, nargs="+", default=[10, 60])
     args = ap.parse_args()
-    phases = {"ruhig 0-39": (0, 39), "Sprung 50-70": (50, 70), "alle": (0, 10**6)}
+    phases = {"ruhig 0-39": (0, 39), "Fenster 45-75": (45, 75), "Sprung 50-70": (50, 70), "f60": (60, 60),
+              "alle": (0, 10**6)}
     scenes = {}
     for d in map(Path, args.result_dirs):
         d = d.expanduser()

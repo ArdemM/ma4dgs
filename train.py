@@ -15,6 +15,10 @@
 # Eigene Erweiterung für 4DAnyone-Szenen mit skeleton/ (ma4dgs/skeleton.py):
 #   --init-velocity skeleton     Startgeschwindigkeit aus dem 3D-Skelett
 #   --lambda-skel 1e-2           Geschwindigkeit zum Skelett hin regularisieren
+# Diagnosen zur schnellen Bewegung (Stufe 0, Ansaetze_schnelle_Bewegung.md):
+#   --frame-start 45 --num-frames 31   nur ein Zeitfenster trainieren (Zeit auf die ganze Sequenz normiert)
+#   --max-duration-frames 0.4          Dauer s nach oben begrenzen (in Frames)
+#   --no-learn-times                   μₜ fest auf den Frame der Initialisierung
 #
 # Aufruf:
 #   python train.py --data-dir ~/masterarbeit/data/n3dv/flame_steak_50f \
@@ -59,6 +63,9 @@ class Config:
     test_cams: List[str] = field(default_factory=lambda: ["cam00"])
     # Anzahl Frames (-1 = alle vorhandenen)
     num_frames: int = -1
+    # Erster Frame eines Zeitfensters (None = ab Frame 0, Zeit auf die geladenen Frames
+    # normiert). Mit Wert bleibt die Zeit auf die ganze Sequenz normiert (ma4dgs/data.py).
+    frame_start: Optional[int] = None
     # Checkpoint laden und nur auswerten
     ckpt: Optional[str] = None
 
@@ -90,6 +97,13 @@ class Config:
     velocities_lr_final: Optional[float] = None
     # Geschwindigkeit optimieren (False = statische Gaußsche, nur zeitlich begrenzt)
     learn_velocity: bool = True
+    # μₜ optimieren (False = jede Gaußsche bleibt am Frame ihrer Initialisierung bzw.
+    # am Frame der Gaußschen, von der sie bei der Relokation kopiert wurde)
+    learn_times: bool = True
+    # Obergrenze der Dauer s in Frames (0 = keine). log s wird nach jedem Schritt
+    # geklemmt. Mit 0,4 und festem μₜ trägt eine Gaußsche zu den Nachbarframes nur
+    # noch exp(−½·(1/0,4)²) ≈ 4 % bei (Pro-Frame-Modus, Diagnose D3)
+    max_duration_frames: float = 0.0
     # Anfangsgeschwindigkeit: 0, k-NN-Zuordnung zum nächsten Keyframe oder aus dem
     # 3D-Skelett der Szene (skeleton/, ma4dgs/skeleton.py)
     init_velocity: Literal["zero", "knn", "skeleton"] = "zero"
@@ -160,24 +174,31 @@ class Runner:
         self.writer = SummaryWriter(log_dir=str(self.result_dir / "tb"))
 
         self.data = MultiViewVideo(
-            cfg.data_dir, cfg.test_cams, cfg.num_frames, workers=cfg.load_workers
+            cfg.data_dir, cfg.test_cams, cfg.num_frames, workers=cfg.load_workers,
+            frame_start=cfg.frame_start,
         )
         if cfg.background != "image" or cfg.lambda_mask > 0:
             assert self.data.masks is not None, f"--background/--lambda-mask brauchen {cfg.data_dir}/masks"
         self.scene_scale = self.data.scene_scale * 1.1
         F = self.data.num_frames
         print(
-            f"Szene: {len(self.data.cam_names)} Kameras, {F} Frames, "
+            f"Szene: {len(self.data.cam_names)} Kameras, {F} Frames "
+            f"(ab Frame {self.data.frame_start}, t {self.data.times[0]:.3f}–{self.data.times[-1]:.3f}), "
             f"Test: {[self.data.cam_names[c] for c in self.data.test_cams]}, "
             f"scene_scale {self.scene_scale:.3f}"
         )
 
         if cfg.init_duration is None:
-            self.init_duration = 2.0 * cfg.keyframe_step / max(F - 1, 1)
+            self.init_duration = 2.0 * cfg.keyframe_step / self.data.frames_per_unit
         else:
             self.init_duration = cfg.init_duration
         # Geschwindigkeit pro normierter Zeiteinheit -> cm pro Frame
-        self.v_to_cm = 100.0 / (max(F - 1, 1) * self.data.meter)
+        self.v_to_cm = 100.0 / (self.data.frames_per_unit * self.data.meter)
+        self.log_s_max = (
+            math.log(cfg.max_duration_frames / self.data.frames_per_unit)
+            if cfg.max_duration_frames > 0
+            else None
+        )
         self.skeleton = None
         if cfg.init_velocity == "skeleton" or cfg.lambda_skel > 0:
             self.skeleton = SkeletonPrior(
@@ -207,6 +228,9 @@ class Runner:
             {k: torch.nn.Parameter(v) for k, v in init.items()}
         ).to(self.device)
         self.splats["velocities"].requires_grad_(cfg.learn_velocity)
+        self.splats["times"].requires_grad_(cfg.learn_times)
+        if self.log_s_max is not None:
+            self.splats["durations"].data.clamp_(max=self.log_s_max)
         print(
             f"Init: {len(keyframes)} Keyframes, {len(self.splats['means'])} Gaußsche, "
             f"Dauer s = {self.init_duration:.4f}, "
@@ -379,6 +403,9 @@ class Runner:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             scheduler.step()
+            if self.log_s_max is not None:
+                with torch.no_grad():
+                    self.splats["durations"].clamp_(max=self.log_s_max)
 
             if (
                 self.relocator is not None
@@ -470,14 +497,17 @@ class Runner:
                 }
                 for k, v in m.items():
                     metrics[k].append(v)
-                per_frame.append({"cam": name, "frame": frame, "visible_GS": int(mask.sum()), **m})
+                # Frame-Nummer der Sequenz (bei Zeitfenstern frame_start + lokaler Index)
+                per_frame.append(
+                    {"cam": name, "frame": self.data.frame_start + frame, "visible_GS": int(mask.sum()), **m}
+                )
 
                 canvas = torch.cat([pixels, colors], dim=2)[0].cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
                 writer.append_data(canvas)
                 if frame in (0, self.data.num_frames // 2, self.data.num_frames - 1):
                     imageio.imwrite(
-                        self.result_dir / "renders" / f"test_{name}_f{frame:05d}_step{step}.png",
+                        self.result_dir / "renders" / f"test_{name}_f{self.data.frame_start + frame:05d}_step{step}.png",
                         canvas,
                     )
             writer.close()
@@ -557,7 +587,7 @@ class Runner:
             pos = focus + o
             path[i, :3] = viewmatrix(focus - pos, -up, pos)
             path[i, 3, 3] = 1.0
-        times = np.linspace(0.0, 1.0, n)
+        times = np.linspace(self.data.times[0], self.data.times[-1], n)
         cams = self.data.train_cams
 
         bg = self.background(train=False)

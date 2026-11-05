@@ -19,7 +19,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -43,6 +43,7 @@ class MultiViewVideo:
         num_frames: int = -1,
         normalize: bool = True,
         workers: int = 16,
+        frame_start: Optional[int] = None,
     ):
         self.scene_dir = Path(scene_dir).expanduser()
         parser = Parser(
@@ -65,10 +66,20 @@ class MultiViewVideo:
         self.scene_scale = float(parser.scene_scale)
 
         available = len(list((self.scene_dir / "images" / self.cam_names[0]).glob("*.png")))
-        self.num_frames = available if num_frames <= 0 else min(num_frames, available)
-        # Normierte Zeit t ∈ [0, 1], erster Frame 0, letzter Frame 1
+        # Zeitfenster: frame_start = None lädt die ersten num_frames Frames und normiert
+        # die Zeit auf sie. Mit frame_start werden die Frames frame_start … frame_start +
+        # num_frames − 1 geladen, die Zeit bleibt aber auf die ganze Sequenz normiert, damit
+        # Lernraten, Dauern und Geschwindigkeiten dieselbe Bedeutung haben wie im vollen Lauf.
+        # Lokale Indizes 0 … F − 1, Dateinummer = frame_start + Index.
+        self.frame_start = frame_start or 0
+        remaining = available - self.frame_start
+        assert remaining > 0, f"frame_start {self.frame_start} ≥ {available} Frames"
+        self.num_frames = remaining if num_frames <= 0 else min(num_frames, remaining)
         F = self.num_frames
-        self.times = np.linspace(0.0, 1.0, F) if F > 1 else np.zeros(1)
+        # Frame-Abstände pro normierter Zeiteinheit (Umrechnung Zeit ↔ Frames)
+        self.frames_per_unit = max((F if frame_start is None else available) - 1, 1)
+        # Normierte Zeit, erster Frame der Sequenz 0, letzter 1
+        self.times = (self.frame_start + np.arange(F)) / self.frames_per_unit
 
         unknown = set(test_cams) - set(self.cam_names)
         assert not unknown, f"Unbekannte Testkameras: {unknown}"
@@ -82,7 +93,7 @@ class MultiViewVideo:
         self.masks = self._load_images(workers, "masks") if (self.scene_dir / "masks").is_dir() else None
 
     def image_path(self, cam: int, frame: int, kind: str = "images") -> Path:
-        return self.scene_dir / kind / self.cam_names[cam] / f"{frame:05d}.png"
+        return self.scene_dir / kind / self.cam_names[cam] / f"{self.frame_start + frame:05d}.png"
 
     def _load_images(self, workers: int, kind: str = "images") -> torch.Tensor:
         """Alle Bilder (bzw. Masken) einmal dekodieren und im Hauptspeicher halten (uint8)."""
@@ -111,6 +122,7 @@ class MultiViewVideo:
 
         Rückgabe: Punkte [M, 3] float32, Farben [M, 3] float32 in [0, 1].
         """
+        frame += self.frame_start
         pts = np.load(self.scene_dir / "points" / f"points3d_frame{frame:06d}.npy")
         rgb = np.load(self.scene_dir / "points" / f"colors_frame{frame:06d}.npy")
         pts = transform_points(self.transform, pts.astype(np.float64)).astype(np.float32)
@@ -130,7 +142,7 @@ class MultiViewVideo:
         assert (d / "keypoints3d.npy").exists(), (
             f"{d}/keypoints3d.npy fehlt: scripts/prepare_4danyone.py mit conditioning/ der 4DAnyone-Ausgabe"
         )
-        kp = np.load(d / "keypoints3d.npy").astype(np.float64)[: self.num_frames]
+        kp = np.load(d / "keypoints3d.npy").astype(np.float64)[self.frame_start : self.frame_start + self.num_frames]
         assert len(kp) == self.num_frames, f"Skelett hat {len(kp)} Frames, Szene {self.num_frames}"
         names = json.loads((d / "keypoint_names.json").read_text())
         F, K, _ = kp.shape

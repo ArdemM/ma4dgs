@@ -18,7 +18,9 @@ Alles, was von anderen stammt und hier verwendet wird:
 - **gsplat (Apache-2.0)**, [nerfstudio-project/gsplat](https://github.com/nerfstudio-project/gsplat) 1.6.0:
   - `train.py` ist an `gsplat/examples/simple_trainer.py` angelehnt, der Lizenzhinweis steht im Dateikopf.
   - `ma4dgs/relocation.py` ist an `gsplat/strategy/ops.py` (`relocate`) angelehnt.
-  - Rasterisierer, SH-Auswertung und PLY-Export werden aus `gsplat` importiert, COLMAP-Parser und Hilfsfunktionen (`knn`, `rgb_to_sh`, `set_random_seed`) unverändert aus `gsplat/examples` (`datasets/`, `utils.py`).
+  - Die Render-Funktion in `scripts/view_4d.py` folgt im Aufbau `gsplat/examples/simple_viewer.py` (Bildgröße und Kamera aus nerfview `CameraState`).
+  - Rasterisierer, SH-Auswertung und PLY-Export werden aus `gsplat` importiert, COLMAP-Parser und Hilfsfunktionen (`knn`, `rgb_to_sh`, `set_random_seed`, `transform_points`, `focus_point_fn`, `viewmatrix`) unverändert aus `gsplat/examples` (`datasets/`, `utils.py`).
+  - `gsplat/examples/simple_trainer.py` wird für `scripts/diag_static_ref.py` unverändert als Referenz-3DGS ausgeführt (Strategien `default` und `mcmc`). Zur Auswertung lädt das Skript dessen Checkpoint mit dem COLMAP-Parser aus `gsplat/examples` und rendert mit `gsplat.rasterization`.
 - **FreeTimeGsVanilla (AGPL-3.0)**, [OpsiClear-4DGS/FreeTimeGsVanilla](https://github.com/OpsiClear-4DGS/FreeTimeGsVanilla): nur als Referenz ausgeführt und gelesen (`scripts/run_vanilla_ref.sh`), kein Code übernommen. Das Datenlayout (`images/camXX/`, `points/`) folgt seinem Format, damit beide dieselben Daten lesen.
 - **BiRefNet (MIT)**, P. Zheng et al., *Bilateral Reference for High-Resolution Dichotomous Image Segmentation*, CAAI AIR 2024. Modell [`ZhengPeng7/BiRefNet`](https://huggingface.co/ZhengPeng7/BiRefNet), Revision `e2bf8e4` (dieselbe wie in 4DAnyone). `scripts/prepare_4danyone.py` lädt es über Hugging Face transformers (der Modellcode kommt per `trust_remote_code` aus dem Modell-Repository) und berechnet damit die Vordergrundmasken.
 
@@ -28,8 +30,15 @@ Alles, was von anderen stammt und hier verwendet wird:
 - PyTorch, torchmetrics (PSNR, SSIM, LPIPS mit den Netzgewichten von R. Zhang et al., CVPR 2018), viser und nerfview (Viewer), tyro, OpenCV, imageio, scikit-learn, pycolmap, NumPy, PyYAML, tqdm
 
 **Methoden für generierte Ansichten** (`scripts/prepare_4danyone.py`)
-- **Visual Hull / Space Carving**: A. Laurentini, *The Visual Hull Concept for Silhouette-Based Image Understanding*, IEEE TPAMI 1994. Eigene Umsetzung zur Initialisierung pro Frame.
+- **Visual Hull / Space Carving**: A. Laurentini, *The Visual Hull Concept for Silhouette-Based Image Understanding*, IEEE TPAMI 1994. Eigene Umsetzung zur Initialisierung pro Frame. `scripts/diag_silhouettes.py` nutzt dieselbe Umsetzung, um die Silhouetten-Konsistenz zu prüfen (Hull aus allen Kameras außer einer).
 - **3D-Skelett aus 4DAnyone** (Skelett-Prior, `ma4dgs/skeleton.py`): Die Punkte (`conditioning/keypoints_3d.npy`) erzeugt 4DAnyone, hier werden sie nur gelesen. Dahinter stehen **GVHMR** (Z. Shen et al., *World-Grounded Human Motion Recovery via Gravity-View Coordinates*, SIGGRAPH Asia 2024), das aus dem Eingabevideo eine **SMPL-X**-Sequenz schätzt (G. Pavlakos et al., *Expressive Body Capture: 3D Hands, Face, and Body from a Single Image*, CVPR 2019), und ein Regressor von 4DAnyone auf die 70 Punkte des **Goliath**-Schemas (R. Khirodkar et al., *Sapiens2*, ICLR 2026). Die Liste der Knochen in `ma4dgs/skeleton.py` folgt den Verbindungen, die 4DAnyone für sein Goliath40-Skelett zeichnet (`fdanyone/skeleton/keypoints.py`), ohne Fingerglieder, plus Hals–Nase und Augen-Querverbindung. Geschwindigkeitsfeld, Konfidenz und Regularisierung sind eigene Erweiterung.
+
+**Methoden und Modelle der Diagnose zur zeitlichen Konsistenz** (`scripts/diag_input_consistency.py`)
+- **RAFT**: Z. Teed und J. Deng, *RAFT: Recurrent All-Pairs Field Transforms for Optical Flow*, ECCV 2020. Implementierung und vortrainierte Gewichte `Raft_Large_Weights.DEFAULT` aus torchvision (BSD-3).
+- **Vorwärts-Rückwärts-Prüfung** des Flusses (Schwelle 0,01·(|F|² + |B|²) + 0,5): N. Sundaram, T. Brox und K. Keutzer, *Dense Point Trajectories by GPU-Accelerated Large Displacement Optical Flow*, ECCV 2010.
+- **Varianz des Laplace-Bilds als Schärfemaß**: J. L. Pech-Pacheco et al., *Diatom autofocusing in brightfield microscopy: a comparative study*, ICPR 2000.
+- **Zeitliche Gruppierung zu je 4 Frames** im Video-VAE (4n+1 Frames → n+1 Latents) laut 4DAnyone-Paper, Anhang A (Basis Wan2.2). Hier nur als Annahme für die Auswertung nach f mod 4.
+- **Quellvideo**: `conditioning/source.mkv` der 4DAnyone-Ausgabe, das Eingabevideo des Seilspringens (vermutlich der Pexels-Clip 2785536; Quelle und Lizenz noch nicht festgehalten). Umkodierung zum Vergleich mit libx264 über ffmpeg.
 
 **Daten**
 - **Neural3DV / DyNeRF**: T. Li et al., *Neural 3D Video Synthesis from Multi-view Video*, CVPR 2022 (Meta). Szene `flame_steak`.
@@ -152,6 +161,19 @@ Mit Masken lernt `train.py` nur den Vordergrund (`--background random|black|whit
 
 4DAnyone rendert seine Skelett-Videos aus 3D-Punkten (`keypoints_3d.npy`), die es in einem versteckten Arbeitsordner neben der Ausgabe ablegt: `.<clip>.scratch-XXXXXXXX/conditioning/`. Er wird normalerweise am Ende gelöscht und bleibt nur stehen, wenn das Aufräumen scheitert. Liegt dieser `conditioning/`-Ordner in der 4DAnyone-Ausgabe (`--src`), übernimmt `prepare_4danyone.py` die Punkte nach `skeleton/` (Schritt 5; mit `--skip-frames --skip-masks --skip-hull` auch nachträglich).
 `train.py --init-velocity skeleton` startet jede Gaußsche mit der Skelett-Geschwindigkeit an ihrer Position, `--lambda-skel` zieht die gelernte Geschwindigkeit während des ganzen Trainings dorthin (Abweichung in cm pro Frame, gewichtet mit der Nähe zum Skelett). `scripts/diag_skeleton.py <result_dir> ...` vergleicht gelernte und Skelett-Geschwindigkeit und zeigt PSNR/LPIPS getrennt nach ruhiger Phase und Sprung.
+
+### Diagnosen zur schnellen Bewegung (Stufe 0)
+
+- `train.py --frame-start 45 --num-frames 31` trainiert nur ein Zeitfenster. Die Zeit bleibt auf die ganze Sequenz normiert, Lernraten, Dauern und Geschwindigkeiten bedeuten also dasselbe wie im vollen Lauf. Die Auswertung schreibt die Frame-Nummern der Sequenz.
+- `--max-duration-frames 0.4 --no-learn-times` erzwingt einen Pro-Frame-Modus: Die Dauer wird nach jedem Schritt auf 0,4 Frames begrenzt, μₜ bleibt am Frame der Initialisierung.
+- `scripts/run_stage0.sh` startet alle Läufe von Stufe 0 (Seeds, Zeitfenster, Pro-Frame-Modus) nach `~/masterarbeit/results/4danyone/st0/`.
+- `scripts/diag_input_consistency.py` misst die zeitliche Konsistenz der Eingabevideos (Warp-Residuum mit RAFT-Fluss, Schärfe, Farbe pro Frame) und vergleicht mit dem echten Quellvideo (`conditioning/source.mkv`).
+- `scripts/eval_person.py <result_dir> ...` misst PSNR und Fehler nur im Personenbereich der Testkameras (Maske um 5 px erweitert), weil der Vollbild-PSNR durch den schwarzen Hintergrund etwa 8–9 dB zu hoch liegt.
+
+### Diagnose Grundschärfe: Daten oder Trainer?
+
+- `scripts/diag_static_ref.py prepare` schreibt einen Frame einer 4DAnyone-Szene als gewöhnliche COLMAP-Szene mit schwarz hinterlegten Bildern, die gsplat `simple_trainer.py` unverändert trainiert. `eval` vergleicht danach den Personenbereich-PSNR von Trainings- und Testkameras für den gsplat-Checkpoint und optional einen statischen Lauf des eigenen Trainers.
+- `scripts/diag_silhouettes.py <szene> --frames 10 60 --res 128 256 512` prüft ohne Training, ob Posen und Masken der Kameras zusammenpassen: Für jede Kamera wird der Visual Hull aus allen anderen berechnet und mit ihrer Maske verglichen (Deckung, Saumbreite in Pixeln, bester Bildversatz). Mehrere `--res` trennen Diskretisierung von echter Inkonsistenz.
 
 ## Referenz: FreeTimeGsVanilla
 
